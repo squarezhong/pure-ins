@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pure Ins
 // @namespace    https://github.com/squarezhong/pure-ins
-// @version      0.1.2
+// @version      0.2.0
 // @description  关注优先，清理 Instagram 推荐与显式广告，保留主动搜索、帖子、Stories 和日常互动。
 // @author       squarezhong
 // @homepageURL  https://github.com/squarezhong/pure-ins
@@ -24,13 +24,15 @@
   if (window.top !== window.self || !HOSTS.includes(location.hostname)) return;
   const KEY = 'pure-ins-settings-v1', UI = 'pure-ins-settings', HIDDEN = 'pure-ins-hidden';
   const NOTE = 'pure-ins-notice';
+  const QUIET = 'pure-ins-quiet-notifications', KEEP = 'pure-ins-notification-part';
   const OPTIONS = [
-    ['following', '首页优先进入原生关注流（入口可用时）', true],
-    ['strict', '过滤首页明确推荐和未关注作者', true],
+    ['followingList', '首页和 logo 打开自己的关注名单', true],
+    ['hideHome', '隐藏 Home 入口', true],
     ['ads', '清理显式广告', true], ['modules', '清理推荐关注与相关推荐', true],
     ['explore', '清理发现推荐网格（保留主动搜索）', true],
     ['reels', '清理 Reels 推荐流（保留直接打开的视频）', true],
-    ['navigation', '隐藏发现、Reels 和平台推广入口', true]
+    ['navigation', '隐藏发现、Reels 和平台推广入口', true],
+    ['notificationBadges', '始终隐藏通知红点和数字徽标（保留通知入口）', true]
   ];
   const defaults = Object.fromEntries(OPTIONS.map(([k, , v]) => [k, v]));
   const query = (s, root = document) => [...root.querySelectorAll(s)];
@@ -47,7 +49,7 @@
     comment: /^(Comment|评论|評論|留言)$/i,
     save: /^(Save|Remove|Unsave|收藏|保存|儲存|取消收藏|取消保存|移除)$/i,
     search: /^(Search|搜索|搜尋|搜寻)$/i,
-    home: /^(Home|Instagram|首页|首頁|主页|主頁)$/i,
+    notifications: /^(Notifications|通知)$/i,
     reelNav: /^(Reels navigation controls|Reels 导航控件|Reels 導覽控制項)$/i,
     player: /^(Video player|视频播放器|影片播放器)$/i
   };
@@ -59,6 +61,10 @@
   catch (_) { settings = normalize(null); }
   let hidden = new Set(), frame = 0, observer, timer, stopped = false, lastURL = '';
   let reelTarget = null, reelSession = false, reelAnchor = '', reelIdentity = '';
+  let quietRoots = new Set(), quietParts = new Set();
+  const dirtyCards = new Set(), headers = new WeakMap();
+  let adCards = new Set(), fullScan = true, shellDirty = true, shellHidden = new Set();
+  let pendingList = null, listAttempted = false, homeIntent = false;
   let ui, dialog, status, lastFocus, saving = false;
 
   function urlOf(a) {
@@ -102,30 +108,41 @@
     }
     return null;
   }
-  function nativeFollowing() {
-    for (const a of query('a[href]')) {
-      if (a.closest(`article,${EDITOR},[role="dialog"],${OWNED}`) || !words.following.test(label(a))) continue;
-      const u = urlOf(a);
-      // These validate a rendered link; no URL is fabricated or persisted across accounts.
-      if (local(u) && (u.pathname === '/' && u.searchParams.get('variant') === 'following' || /^\/following\/?$/.test(u.pathname))) return u.href;
-    }
-    return null;
+  function navLinks() {
+    return query('a[href]').filter(a => !a.closest(`main,[role="main"],article,[role="dialog"],${EDITOR},${OWNED}`));
   }
-  function enterFollowing(page) {
-    if (!settings.following || page !== 'feed' || location.pathname !== '/' || location.search || location.hash) return;
-    const target = nativeFollowing();
-    if (!target || target === location.href) return;
-    // The target may redirect back when Instagram disables a feature. A session
-    // guard survives that full navigation. If storage is unavailable, stay put.
-    try {
-      const key = 'pure-ins-following-attempt';
-      const old = JSON.parse(sessionStorage.getItem(key) || 'null');
-      if (old?.target === target && Date.now() - old.time < 60000) return;
-      sessionStorage.setItem(key, JSON.stringify({ target, time: Date.now() }));
-      location.replace(target);
-    } catch (_) { /* Filtering continues without automatic navigation. */ }
+  function ownProfile() {
+    return navLinks().find(a => profileLink(a) &&
+      (/^(Profile|个人主页|個人檔案|個人主頁)$/i.test(text(a)) || query('img', a).some(isAvatar)));
+  }
+  function requestList() {
+    pendingList = { until: Date.now() + 10000, from: location.pathname, profile: '', clicked: false };
+    listAttempted = true;
+    enterFollowing();
+  }
+  function enterFollowing() {
+    if (!settings.followingList) { pendingList = null; return; }
+    if (!pendingList && !listAttempted && location.pathname === '/' && !history.state?.pureInsHome && !homeIntent) requestList();
+    const task = pendingList;
+    if (!task) return;
+    if (Date.now() > task.until) { pendingList = null; return; }
+    const profile = ownProfile(), path = profile && urlOf(profile).pathname;
+    if (!path) return;
+    if (task.profile && task.profile !== path || ![task.from, path].includes(location.pathname)) { pendingList = null; return; }
+    task.profile = path;
+    if (location.pathname !== path) {
+      if (!task.clicked) { task.clicked = true; profile.click(); }
+      return;
+    }
+    if (query('[role="dialog"] h1,[role="dialog"] h2').some(e => words.following.test(text(e)))) { pendingList = null; return; }
+    const entry = query('main a,main button,[role="main"] a,[role="main"] button').find(e =>
+      !e.closest('article,[role="dialog"]') && /^(?:[\d,.万萬]+\s*(?:following|关注|關注|追蹤中)|(?:关注|關注|追蹤中)\s*[\d,.万萬]+)$/i.test(text(e)));
+    if (entry) { pendingList = null; entry.click(); }
   }
   function navigation(desired) {
+    if (settings.hideHome) for (const a of navLinks()) {
+      if (/^(Home|首页|首頁|主页|主頁)$/i.test(label(a)) && urlOf(a)?.pathname === '/') desired.add(a);
+    }
     if (!settings.navigation) return;
     for (const a of query('a[href]')) {
       // Profile tabs, authored links, search results and post dialogs are not nav.
@@ -142,18 +159,55 @@
           local(u) && /^\/(popular|accounts\/meta_verified)\/?$/.test(u.pathname))) desired.add(e);
     }
   }
-  function cards(desired, page) {
-    if (!settings.ads && !(page === 'feed' && settings.strict)) return;
-    // Strict source filtering is feed-only; a direct post is always intentional.
-    for (const card of query('main article,[role="main"] article')) {
-      if (card.parentElement.closest('article') || card.closest('[role="dialog"]')) continue;
-      const header = headerOf(card);
-      if (!header) continue;
-      const ad = settings.ads && leafMatches(header, words.ad);
-      const suggested = page === 'feed' && settings.strict && (leafMatches(header, words.suggested) ||
-        query('button,[role="button"]', header).some(e => words.follow.test(text(e))));
-      if ((ad && !['post', 'reel'].includes(page)) || suggested) desired.add(card);
+  function reconcileClass(previous, next, name) {
+    for (const el of previous) if (!next.has(el)) el.classList.remove(name);
+    for (const el of next) if (!el.classList.contains(name)) el.classList.add(name);
+    return next;
+  }
+  function notifications() {
+    const roots = new Set(), parts = new Set();
+    if (settings.notificationBadges) for (const icon of query('svg[aria-label]')) {
+      if (!words.notifications.test(label(icon))) continue;
+      const root = icon.closest('a,button,[role="link"],[role="button"]');
+      if (!root || root.closest(`main,[role="main"],article,[role="dialog"],${EDITOR},${OWNED}`)) continue;
+      roots.add(root);
+      const keep = el => { for (; el && el !== root; el = el.parentElement) parts.add(el); };
+      keep(icon);
+      for (const el of query('*', icon)) parts.add(el);
+      for (const el of query('span,div', root)) {
+        const ownText = [...el.childNodes].filter(n => n.nodeType === Node.TEXT_NODE).map(n => n.textContent).join('').trim();
+        if (words.notifications.test(ownText)) keep(el);
+      }
     }
+    // Preserve only the icon, label and their ancestor branches. CSS also hides
+    // newly inserted badges immediately, without relying on obfuscated classes,
+    // badge color, unread counts, or marking any notifications as read.
+    quietParts = reconcileClass(quietParts, parts, KEEP);
+    quietRoots = reconcileClass(quietRoots, roots, QUIET);
+  }
+  function cards(page) {
+    if (fullScan) {
+      for (const card of query('main article,[role="main"] article')) dirtyCards.add(card);
+    }
+    for (const card of dirtyCards) {
+      adCards.delete(card);
+      if (!card.isConnected || !settings.ads || ['protected', 'post', 'reel'].includes(page) ||
+          card.parentElement.closest('article') || card.closest('[role="dialog"]')) continue;
+      const header = headerOf(card); headers.set(card, header);
+      if (header && leafMatches(header, words.ad)) adCards.add(card);
+    }
+    for (const card of adCards) if (!card.isConnected) adCards.delete(card);
+    dirtyCards.clear();
+  }
+  function sidebars() {
+    const roots = new Set(query('aside'));
+    for (const button of query('main button,main [role="button"],[role="main"] button,[role="main"] [role="button"]')) {
+      if (!/^(Switch|切换|切換)$/i.test(text(button)) || button.closest('article,[role="dialog"]')) continue;
+      let root = button;
+      while (root.parentElement && !root.parentElement.matches('main,[role="main"]') && !root.parentElement.querySelector('article')) root = root.parentElement;
+      roots.add(root);
+    }
+    return [...roots];
   }
   function isModuleSafe(el) {
     return !el.matches('main,body,html,[role="main"]') &&
@@ -163,7 +217,7 @@
   function modules(desired, page) {
     if (!settings.modules) return;
     const related = /^(More posts from|More from|Related posts|Suggested reels|更多帖子|更多貼文|相关帖子|相關貼文|推荐短视频|推薦連續短片)$/i;
-    for (const title of query('h2,h3,h4,span,div')) {
+    for (const title of (page === 'feed' ? sidebars() : [document]).flatMap(root => query('h2,h3,h4,span,div', root))) {
       if (title.closest(`article,a,button,[role="button"],[role="dialog"],${EDITOR},${OWNED}`)) continue;
       // The current detail heading is a text node followed by an author <a>.
       if (title.children.length && ![...title.children].every(e => e.matches('a[href]') && profileLink(e))) continue;
@@ -181,7 +235,7 @@
       }
     }
     // "Similar accounts" is an explicit profile recommendation control.
-    for (const b of query('main button,main [role="button"]')) {
+    for (const b of page === 'feed' ? [] : query('main button,main [role="button"]')) {
       if (!b.closest(`article,[role="dialog"],${EDITOR}`) && /^(Similar accounts|类似账户|類似帳號|类似账号|推薦用戶)$/i.test(label(b))) desired.add(b);
     }
   }
@@ -277,12 +331,14 @@
     if (!reelTarget.isConnected || recycled) showNotice(main, '当前短视频已结束或离开页面，后续推荐已隐藏。');
   }
   function stopHiddenMedia(root = document) {
-    for (const video of query('video', root)) if (video.closest(`.${HIDDEN}`) && !video.paused) video.pause();
+    for (const video of (root.matches?.('video') ? [root] : query('video', root))) if (video.closest(`.${HIDDEN}`) && !video.paused) video.pause();
   }
   function injectStyle() {
     if (document.getElementById('pure-ins-style')) return;
     const s = document.createElement('style'); s.id = 'pure-ins-style';
     s.textContent = `.${HIDDEN}{display:none!important}#${UI}{color-scheme:light dark}
+      .${QUIET} :not(.${KEEP}){display:none!important}
+      .${QUIET}::before,.${QUIET}::after,.${QUIET} *::before,.${QUIET} *::after{content:none!important;display:none!important}
       #${NOTE}{font:15px/1.7 system-ui,sans-serif;max-width:560px;margin:15vh auto;padding:24px;border:1px solid #8885;border-radius:16px;color:inherit}#${NOTE} a{color:#517ee8}`;
     document.documentElement.append(s);
   }
@@ -293,6 +349,11 @@
     try {
       injectStyle(); const page = route();
       if (lastURL !== location.href) {
+        fullScan = shellDirty = true;
+        if (homeIntent && location.pathname === '/') {
+          history.replaceState({ ...history.state, pureInsHome: true }, ''); homeIntent = false;
+        }
+        if (location.pathname !== '/') listAttempted = false;
         const nextId = postId(location.pathname);
         // Explicit clicks/popstate reset the anchor separately; automatic changes
         // within a reel session must not promote a recommended video to the target.
@@ -300,17 +361,26 @@
         if (!reelAnchor && page === 'reel') reelAnchor = nextId;
         lastURL = location.href;
       }
-      const desired = new Set();
-      if (page !== 'protected') {
-        navigation(desired); cards(desired, page); modules(desired, page); explore(desired, page); reels(desired, page);
-      } else document.getElementById(NOTE)?.remove();
+      if (shellDirty) {
+        shellHidden = new Set();
+        navigation(shellHidden);
+        if (page !== 'protected') { modules(shellHidden, page); explore(shellHidden, page); reels(shellHidden, page); }
+        else document.getElementById(NOTE)?.remove();
+        notifications();
+      }
+      cards(page);
+      const desired = new Set([...shellHidden, ...adCards].filter(e => e.isConnected));
       for (const el of hidden) if (!desired.has(el)) el.classList.remove(HIDDEN);
-      for (const el of desired) el.classList.add(HIDDEN);
+      for (const el of desired) if (!hidden.has(el)) { el.classList.add(HIDDEN); stopHiddenMedia(el); }
       hidden = desired;
-      stopHiddenMedia(); enterFollowing(page);
+      fullScan = shellDirty = false;
     } finally { observe(); }
+    enterFollowing();
   }
-  function schedule() { if (!frame && !stopped) frame = requestAnimationFrame(apply); }
+  function schedule(all = true) {
+    if (all) fullScan = shellDirty = true;
+    if (!frame && !stopped) frame = requestAnimationFrame(apply);
+  }
   function observe() {
     if (!stopped && document.documentElement) observer?.observe(document.documentElement, {
       childList: true, subtree: true, characterData: true, attributes: true,
@@ -330,7 +400,7 @@
       button:focus-visible,input:focus-visible{outline:3px solid #9674e7;outline-offset:2px}.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:18px}.save{margin-left:auto;background:#6840b4;color:#fff}.note{font-size:12px;opacity:.8}.status{min-height:22px}.error{color:#d25536}
       @media(prefers-color-scheme:dark){dialog{color:var(--pure-ins-text,#eee);background:var(--pure-ins-background,#242424)}}
     </style><dialog aria-labelledby="pi-title"><h2 id="pi-title">Pure Ins</h2><p>让关注成为首页，让浏览由你决定。</p>
-      <form><div class="grid"></div><p class="note">未知来源保留；主动搜索、帖子和个人主页不限制作者。关注入口不可用时留在首页过滤。关闭清理不会自动恢复视频播放。</p>
+      <form><div class="grid"></div><p class="note">首页只过滤明确广告，不按关注关系过滤。可见视频使用原生播放；隐藏视频暂停。关注名单不可用时保留当前页面。</p>
       <div class="actions"><button type="button" class="reset">恢复默认</button><button type="button" class="cancel">取消</button><button type="submit" class="save">保存</button></div>
       <p class="status" role="status" aria-live="polite"></p></form></dialog>`;
     dialog = shadow.querySelector('dialog'); status = shadow.querySelector('.status');
@@ -373,14 +443,35 @@
     stopped = false;
     if (!document.documentElement) { document.addEventListener('DOMContentLoaded', start, { once: true }); return; }
     observer ||= new MutationObserver(records => {
-      if (records.some(r => {
+      for (const r of records) {
         const el = r.target.nodeType === 1 ? r.target : r.target.parentElement;
-        return el && !el.closest(`${OWNED},video,canvas,[contenteditable="true"],textarea`);
-      })) schedule();
+        if (!el || el.closest(`${OWNED},canvas,video,${EDITOR}`)) continue;
+        const card = el.closest('article');
+        if (card) {
+          if (r.type === 'attributes' && r.attributeName === 'class') continue;
+          const header = headers.get(card);
+          if (!header || !header.isConnected || el === card || header.contains(el) || el.contains(header)) dirtyCards.add(card);
+        } else {
+          const added = [...r.addedNodes || []].filter(n => n.nodeType === 1);
+          for (const node of r.removedNodes || []) if (node.nodeType === 1) {
+            if (node.matches('article')) dirtyCards.add(node);
+            else for (const card of query('article', node)) dirtyCards.add(card);
+          }
+          for (const node of added) {
+            if (node.matches('article')) dirtyCards.add(node);
+            else for (const c of query('article', node)) dirtyCards.add(c);
+          }
+          if (route() !== 'feed' || !el.closest('main,[role="main"]') ||
+              added.some(n => !n.matches('article') && !n.querySelector('article')) ||
+              r.type !== 'childList') shellDirty = true;
+        }
+      }
+      if (dirtyCards.size || shellDirty) schedule(false);
+      if (pendingList) enterFollowing();
     });
     observe(); schedule(); clearInterval(timer);
     // Sandbox-safe route detection; no interception of Instagram's private APIs.
-    timer = setInterval(() => { if (lastURL !== location.href) schedule(); }, 500);
+    timer = setInterval(() => { if (lastURL !== location.href) schedule(); if (pendingList) enterFollowing(); }, 500);
   }
   function resetReel() { reelTarget = null; reelSession = false; reelAnchor = ''; reelIdentity = ''; schedule(); }
   try {
@@ -395,10 +486,20 @@
     });
   } catch (error) { console.warn('[Pure Ins] 菜单或同步不可用', error); }
   document.addEventListener('input', schedule, true);
-  document.addEventListener('play', e => { if (e.target.matches?.('video') && e.target.closest(`.${HIDDEN}`)) e.target.pause(); }, true);
+  document.addEventListener('play', e => {
+    if (e.target.matches?.('video') && e.target.closest(`.${HIDDEN}`)) e.target.pause();
+  }, true);
   document.addEventListener('click', e => {
     const a = e.target.closest?.('a[href]');
     const u = a && urlOf(a);
+    if (e.isTrusted && pendingList) pendingList = null;
+    if (a && local(u) && u.pathname === '/' && !a.closest(`main,[role="main"],article,[role="dialog"]`) && !e.ctrlKey && !e.metaKey && !e.shiftKey && !e.altKey && e.button === 0) {
+      if (label(a) === 'Instagram' && settings.followingList) { e.preventDefault(); e.stopImmediatePropagation(); requestList(); return; }
+      if (/^(Home|首页|首頁|主页|主頁)$/i.test(label(a))) {
+        pendingList = null; homeIntent = true; listAttempted = true;
+        if (location.pathname === '/') { history.replaceState({ ...history.state, pureInsHome: true }, ''); homeIntent = false; }
+      }
+    }
     if (local(u) && !u.hash && (postId(u.pathname) || /^\/reels\/?$/.test(u.pathname)) && !a.closest(`.${HIDDEN}`)) resetReel();
   }, true);
   window.addEventListener('popstate', resetReel); window.addEventListener('hashchange', schedule);
